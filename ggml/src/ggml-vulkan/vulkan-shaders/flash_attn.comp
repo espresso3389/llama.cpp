@@ -25,6 +25,15 @@ const uint32_t cols_per_iter = WorkGroupSize / D_split / row_split;
 const uint32_t cols_per_thread = Bc / cols_per_iter;
 const uint32_t num_subgroups = WorkGroupSize / SubGroupSize;
 
+const uint32_t nbatch_K = (HSK < 128) ? HSK : 128;
+const uint32_t nbatch_V_raw = (nbatch_K * Bc) / HSV > cols_per_iter ? (nbatch_K * Bc) / HSV : cols_per_iter;
+const uint32_t nbatch_V = nbatch_V_raw >= Bc   ? Bc   :
+                          nbatch_V_raw >= Bc/2 ? Bc/2 :
+                          nbatch_V_raw >= Bc/4 ? Bc/4 :
+                          cols_per_iter;
+
+const uint32_t batch_K_elems = nbatch_K / D_split / 4;
+const uint32_t batch_V_rows = nbatch_V / cols_per_iter;
 
 layout (binding = 0) readonly buffer Q {float data_q[];};
 layout (binding = 0) readonly buffer QV4 {vec4 data_qv4[];};
@@ -45,9 +54,14 @@ shared FLOAT_TYPE masksh[Bc * masksh_stride];
 const uint32_t qf_stride = HSK / 4 + 1;
 shared FLOAT_TYPEV4 Qf[Br * qf_stride];
 
-const uint32_t D = HSK > HSV ? HSK : HSV;
-const uint32_t kvsh_stride = D / 4 + 1;
-shared FLOAT_TYPEV4 kvsh[SHMEM_STAGING != 0 ? Bc * kvsh_stride : 1];
+const uint32_t kvsh_K_stride = nbatch_K / 4 + 1;
+const uint32_t kvsh_V_stride = HSV / 4 + 1;
+const uint32_t kvsh_K_size = Bc * kvsh_K_stride;
+const uint32_t kvsh_V_size = nbatch_V * kvsh_V_stride;
+shared FLOAT_TYPEV4 kvsh[SHMEM_STAGING != 0 ? (kvsh_K_size > kvsh_V_size ? kvsh_K_size : kvsh_V_size) : 1];
+
+const uint32_t pfsh_stride = Br + 1;
+shared FLOAT_TYPE Pfsh[SHMEM_STAGING != 0 ? (Bc * pfsh_stride) : 1];
 
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
@@ -168,44 +182,65 @@ void main() {
         }
 
         if (SHMEM_STAGING != 0) {
-            barrier();
-            [[unroll]] for (uint32_t idx = 0; idx < Bc * HSK / 4; idx += gl_WorkGroupSize.x) {
-                uint32_t d = (idx + tid) % (HSK / 4);
-                uint32_t c = (idx + tid) / (HSK / 4);
-                if (c < Bc) {
-                    FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(0);
-                    if (!KV_bounds_check || j * Bc + c < KV) {
+            // Chunk shmem loads into nbatch_K-sized blocks
+            [[dont_unroll]]
+            for (uint32_t kbatch_offset = 0; kbatch_offset < HSK; kbatch_offset += nbatch_K) {
+                barrier();
+                [[unroll]] for (uint32_t idx = 0; idx < Bc * nbatch_K / 4; idx += gl_WorkGroupSize.x) {
+                    uint32_t d = (idx + tid) % (nbatch_K / 4);
+                    uint32_t c = (idx + tid) / (nbatch_K / 4);
+                    if (c < Bc) {
+                        FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(0);
+                        if (!KV_bounds_check || j * Bc + c < KV) {
 #if BLOCK_SIZE > 1
-                        uint coord = (j * Bc + c) * k_stride * BLOCK_SIZE + 4 * d;
-                        uint ib = coord / BLOCK_SIZE;
-                        uint iqs = (coord % BLOCK_SIZE);
-                        K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
+                            uint coord = (j * Bc + c) * k_stride * BLOCK_SIZE + kbatch_offset + 4 * d;
+                            uint ib = coord / BLOCK_SIZE;
+                            uint iqs = (coord % BLOCK_SIZE);
+                            K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
 #else
-                        K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c) * k_stride / 4 + d]);
+                            K_Tf = FLOAT_TYPEV4(data_kv4[(k_offset + (j * Bc + c) * k_stride + kbatch_offset) / 4 + d]);
 #endif
+                        }
+
+                        kvsh[c * kvsh_K_stride + d] = K_Tf;
+                    }
+                }
+                barrier();
+
+                [[unroll]] for (uint32_t d = 0; d < batch_K_elems; ++d) {
+                    const uint32_t global_d = kbatch_offset / 4 + d * D_split + d_tid;
+
+                    FLOAT_TYPEV4 Q_cache[rows_per_thread];
+                    [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                        Q_cache[r] = Qf[tile_row(r) * qf_stride + global_d];
                     }
 
-                    kvsh[c * kvsh_stride + d] = K_Tf;
+                    [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+                        if (KV_bounds_check && j * Bc + c * cols_per_iter + col_tid >= KV) {
+                            continue;
+                        }
+
+                        const FLOAT_TYPEV4 K_Tf = kvsh[(c * cols_per_iter + col_tid) * kvsh_K_stride + d * D_split + d_tid];
+                        [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                            Sf[r][c] += ACC_TYPE(dot(Q_cache[r], K_Tf));
+                        }
+                    }
                 }
             }
-            barrier();
-        }
-
-        [[unroll]] for (uint32_t d = 0; d < HSK_per_thread / 4; ++d) {
-            FLOAT_TYPEV4 Q_cache[rows_per_thread];
-            [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                Q_cache[r] = Qf[tile_row(r) * qf_stride + d * D_split + d_tid];
-            }
-
-            [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
-                if (KV_bounds_check && j * Bc + c * cols_per_iter + col_tid >= KV) {
-                    continue;
+        } else {
+            // Just load directly from global memory
+            [[unroll]] for (uint32_t d = 0; d < HSK_per_thread / 4; ++d) {
+                FLOAT_TYPEV4 Q_cache[rows_per_thread];
+                [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                    Q_cache[r] = Qf[tile_row(r) * qf_stride + d * D_split + d_tid];
                 }
 
-                FLOAT_TYPEV4 K_Tf;
-                if (SHMEM_STAGING != 0) {
-                    K_Tf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
-                } else {
+                [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+                    if (KV_bounds_check && j * Bc + c * cols_per_iter + col_tid >= KV) {
+                        continue;
+                    }
+
+                    FLOAT_TYPEV4 K_Tf;
 #if BLOCK_SIZE > 1
                     uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
                     uint ib = coord / BLOCK_SIZE;
@@ -214,9 +249,9 @@ void main() {
 #else
                     K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * k_stride / 4 + d * D_split + d_tid]);
 #endif
-                }
-                [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                    Sf[r][c] += ACC_TYPE(dot(Q_cache[r], K_Tf));
+                    [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                        Sf[r][c] += ACC_TYPE(dot(Q_cache[r], K_Tf));
+                    }
                 }
             }
         }
@@ -267,6 +302,19 @@ void main() {
             Lf[r] = eMf[r]*Lf[r];
         }
 
+        if (SHMEM_STAGING != 0) {
+            barrier();
+            [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+                if (!KV_bounds_check || j * Bc + c * cols_per_iter + col_tid < KV) {
+                    [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                        const FLOAT_TYPE Pf_val = FLOAT_TYPE(exp(float(Sf[r][c]) - Mf[r]));
+                        Pfsh[(c * cols_per_iter + col_tid) * pfsh_stride + tile_row(r)] = Pf_val;
+                        Lf[r] += Pf_val;
+                    }
+                }
+            }
+        }
+
         [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                 Of[r][d] = ACC_TYPE(eMf[r]) * Of[r][d];
@@ -274,45 +322,63 @@ void main() {
         }
 
         if (SHMEM_STAGING != 0) {
-            barrier();
-            [[unroll]] for (uint32_t idx = 0; idx < Bc * HSV / 4; idx += gl_WorkGroupSize.x) {
-                uint32_t d = (idx + tid) % (HSV / 4);
-                uint32_t c = (idx + tid) / (HSV / 4);
-                if (c < Bc) {
-                    FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0);
-                    if (!KV_bounds_check || j * Bc + c < KV) {
-#if BLOCK_SIZE > 1
-                        uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE + 4 * d;
-                        uint ib = coord / BLOCK_SIZE;
-                        uint iqs = (coord % BLOCK_SIZE);
-                        V_Tf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
-#else
-                        V_Tf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c) * v_stride / 4 + d]);
-#endif
+            [[dont_unroll]]
+            for (uint32_t vbatch_offset = 0; vbatch_offset < Bc; vbatch_offset += nbatch_V) {
+                barrier();
+                [[unroll]] for (uint32_t idx = 0; idx < nbatch_V * HSV / 4; idx += gl_WorkGroupSize.x) {
+                    uint32_t d = (idx + tid) % (HSV / 4);
+                    uint32_t c = (idx + tid) / (HSV / 4);
+                    if (vbatch_offset + c < Bc) {
+                        FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0);
+                        if (!KV_bounds_check || j * Bc + vbatch_offset + c < KV) {
+    #if BLOCK_SIZE > 1
+                            uint coord = (j * Bc + vbatch_offset + c) * v_stride * BLOCK_SIZE + 4 * d;
+                            uint ib = coord / BLOCK_SIZE;
+                            uint iqs = (coord % BLOCK_SIZE);
+                            V_Tf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
+    #else
+                            V_Tf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + vbatch_offset + c) * v_stride / 4 + d]);
+    #endif
+                        }
+
+                        kvsh[c * kvsh_V_stride + d] = V_Tf;
+                    }
+                }
+                barrier();
+
+                [[unroll]] for (uint32_t c = 0; c < batch_V_rows; ++c) {
+                    const uint32_t global_c = vbatch_offset + c * cols_per_iter + col_tid;
+                    if (KV_bounds_check && j * Bc + global_c >= KV) {
+                        continue;
                     }
 
-                    kvsh[c * kvsh_stride + d] = V_Tf;
+                    FLOAT_TYPE Pf[rows_per_thread];
+                    [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                        Pf[r] = Pfsh[global_c * pfsh_stride + tile_row(r)];
+                    }
+
+                    [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
+                        const FLOAT_TYPEV4 Vf = kvsh[(c * cols_per_iter + col_tid) * kvsh_V_stride + (d * D_split + d_tid)];
+                        [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                            Of[r][d] += ACC_TYPEV4(Pf[r] * Vf);
+                        }
+                    }
                 }
             }
-            barrier();
-        }
+        } else {
+            [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+                if (KV_bounds_check && j * Bc + c * cols_per_iter + col_tid >= KV) {
+                    continue;
+                }
 
-        [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
-            if (KV_bounds_check && j * Bc + c * cols_per_iter + col_tid >= KV) {
-                continue;
-            }
+                FLOAT_TYPE Pf[rows_per_thread];
+                [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                    Pf[r] = FLOAT_TYPE(exp(float(Sf[r][c]) - Mf[r]));
+                    Lf[r] += Pf[r];
+                }
 
-            FLOAT_TYPE Pf[rows_per_thread];
-            [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                Pf[r] = FLOAT_TYPE(exp(float(Sf[r][c]) - Mf[r]));
-                Lf[r] += Pf[r];
-            }
-
-            [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
-                FLOAT_TYPEV4 Vf;
-                if (SHMEM_STAGING != 0) {
-                    Vf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
-                } else {
+                [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
+                    FLOAT_TYPEV4 Vf;
 #if BLOCK_SIZE > 1
                     uint coord = (j * Bc + c * cols_per_iter + col_tid) * v_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
                     uint ib = coord / BLOCK_SIZE;
@@ -321,9 +387,9 @@ void main() {
 #else
                     Vf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * v_stride / 4 + d * D_split + d_tid]);
 #endif
-                }
-                [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                    Of[r][d] += ACC_TYPEV4(Pf[r] * Vf);
+                    [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                        Of[r][d] += ACC_TYPEV4(Pf[r] * Vf);
+                    }
                 }
             }
         }

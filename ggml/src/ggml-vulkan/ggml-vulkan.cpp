@@ -3250,8 +3250,6 @@ static void ggml_vk_load_shaders(vk_device& device) {
         default:
             if (device->vendor_id == VK_VENDOR_ID_INTEL) {
                 wg_size = 128;
-            } else if (device->subgroup_size > 32 && rows_cols[0] < 4) {
-                wg_size = device->subgroup_size * 2;
             } else {
                 wg_size = device->subgroup_size * 4;
             }
@@ -3276,6 +3274,8 @@ static void ggml_vk_load_shaders(vk_device& device) {
             }
 
             D_split = std::min(std::min(subgroup_size, max_d_split), D_lsb / 4);
+        } else if (path == FA_SCALAR) {
+            D_split = 1;
         } else {
             D_split = std::min(std::min(subgroup_size, 8u), D_lsb / 4);
         }
